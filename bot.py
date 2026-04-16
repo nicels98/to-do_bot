@@ -26,9 +26,15 @@ def extrahiere_todos(text: str) -> list[str]:
         max_tokens=512,
         messages=[{"role": "user", "content":
             f"Extrahiere alle Aufgaben/To-dos aus diesem Text. "
-            f"Antworte NUR mit einer JSON-Liste von Strings, z.B. [\"Aufgabe 1\", \"Aufgabe 2\"]. Text:\n{text}"}]
+            f"Antworte NUR mit einer JSON-Liste von Strings, z.B. [\"Aufgabe 1\", \"Aufgabe 2\"]. "
+            f"Kein anderer Text, keine Erklärung, nur die Liste. Text:\n{text}"}]
     )
-    return json.loads(r.content[0].text)
+    antwort = r.content[0].text.strip()
+    if "```" in antwort:
+        antwort = antwort.split("```")[1]
+        if antwort.startswith("json"):
+            antwort = antwort[4:]
+    return json.loads(antwort.strip())
 
 def todo_hinzufügen(titel: str):
     notion.pages.create(
