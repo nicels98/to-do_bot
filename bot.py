@@ -66,6 +66,9 @@ Neue Aufgabe(n):
 Neue Notiz (keine Aufgabe, nur eine Information oder Gedanke):
 {{"aktion": "neu_notiz", "titel": "kurzer Titel", "inhalt": "vollständiger Text"}}
 
+Notiz zu einem bestehenden To-do hinzufügen (z.B. "zum Thema X noch ergänzen", "bezüglich X", "zur Aufgabe X"):
+{{"aktion": "notiz_zu_todo", "titel": "Titel aus der offenen Liste der am besten passt", "notiz": "der zusätzliche Text"}}
+
 Aufgabe erledigt:
 {{"aktion": "erledigt", "titel": "Titel aus der offenen Liste der am besten passt"}}
 
@@ -97,6 +100,19 @@ def notiz_hinzufügen(titel: str, inhalt: str):
             "Typ":     {"select":    {"name": "Notiz"}},
             "Notizen": {"rich_text": [{"text": {"content": inhalt}}]},
         }
+    )
+
+def notiz_zu_todo_hinzufügen(page_id: str, neue_notiz: str):
+    seite = notion.pages.retrieve(page_id=page_id)
+    alte_notiz = ""
+    try:
+        alte_notiz = seite["properties"]["Notizen"]["rich_text"][0]["plain_text"]
+    except (KeyError, IndexError):
+        pass
+    kombiniert = (alte_notiz + "\n" + neue_notiz).strip() if alte_notiz else neue_notiz
+    notion.pages.update(
+        page_id=page_id,
+        properties={"Notizen": {"rich_text": [{"text": {"content": kombiniert}}]}}
     )
 
 def offene_todos() -> list[dict]:
@@ -150,6 +166,18 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif result["aktion"] == "neu_notiz":
             notiz_hinzufügen(result["titel"], result["inhalt"])
             await msg.edit_text(f"📝 Notiz gespeichert:\n\n{result['inhalt']}")
+
+        elif result["aktion"] == "notiz_zu_todo":
+            gesuchter_titel = result.get("titel", "")
+            notiz_text = result.get("notiz", "")
+            treffer = next((t for t in offene if t["titel"] == gesuchter_titel), None)
+            if not treffer:
+                treffer = next((t for t in offene if gesuchter_titel.lower() in t["titel"].lower()), None)
+            if treffer:
+                notiz_zu_todo_hinzufügen(treffer["id"], notiz_text)
+                await msg.edit_text(f"📝 Notiz zu '{treffer['titel']}' ergänzt:\n\n{notiz_text}")
+            else:
+                await msg.edit_text("Kein passendes To-do gefunden. Nutze /liste um deine To-dos zu sehen.")
 
         elif result["aktion"] == "erledigt":
             gesuchter_titel = result.get("titel", "")
@@ -244,7 +272,7 @@ async def abend_zusammenfassung(ctx):
 lade_chat_ids()
 app = ApplicationBuilder().token(os.environ["TELEGRAM_TOKEN"]).build()
 
-app.job_queue.run_daily(morgen_erinnerung,    time=time(8,  0, tzinfo=ZEITZONE))
+app.job_queue.run_daily(morgen_erinnerung,     time=time(8,  0, tzinfo=ZEITZONE))
 app.job_queue.run_daily(abend_zusammenfassung, time=time(20, 0, tzinfo=ZEITZONE))
 
 app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, sprachnachricht))
