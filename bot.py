@@ -66,7 +66,7 @@ Neue Aufgabe(n):
 Neue Notiz (keine Aufgabe, nur eine Information oder Gedanke):
 {{"aktion": "neu_notiz", "titel": "kurzer Titel", "inhalt": "vollständiger Text"}}
 
-Notiz zu einem bestehenden To-do hinzufügen (z.B. "zum Thema X noch ergänzen", "bezüglich X", "zur Aufgabe X"):
+Notiz zu einem bestehenden To-do hinzufügen:
 {{"aktion": "notiz_zu_todo", "titel": "Titel aus der offenen Liste der am besten passt", "notiz": "der zusätzliche Text"}}
 
 Aufgabe erledigt:
@@ -123,14 +123,18 @@ def offene_todos() -> list[dict]:
             {"property": "Typ", "select": {"equals": "To-do"}},
         ]}
     )["results"]
-    return [
-        {
-            "id": s["id"],
-            "titel": s["properties"]["Name"]["title"][0]["plain_text"],
-            "prioritaet": s["properties"].get("Priorität", {}).get("select", {}).get("name", "Neutral"),
-        }
-        for s in seiten if s["properties"]["Name"]["title"]
-    ]
+    todos = []
+    for s in seiten:
+        if not s["properties"]["Name"]["title"]:
+            continue
+        prioritaet_prop = s["properties"].get("Priorität") or {}
+        select          = prioritaet_prop.get("select") or {}
+        todos.append({
+            "id":         s["id"],
+            "titel":      s["properties"]["Name"]["title"][0]["plain_text"],
+            "prioritaet": select.get("name", "Neutral"),
+        })
+    return todos
 
 def als_erledigt_markieren(page_id: str):
     notion.pages.update(page_id=page_id, properties={"Erledigt": {"checkbox": True}})
@@ -158,8 +162,8 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             for todo in todos:
                 todo_hinzufügen(todo["titel"], todo.get("prioritaet", "neutral"))
             liste = "\n".join(
-                f"{'🔴' if t.get('prioritaet') == 'wichtig' else '⚪'} {t['titel']}"
-                for t in todos
+                f"{'🔴' if todo.get('prioritaet') == 'wichtig' else '⚪'} {todo['titel']}"
+                for todo in todos
             )
             await msg.edit_text(f"✅ {len(todos)} To-do(s) hinzugefügt:\n\n{liste}")
 
@@ -169,7 +173,7 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         elif result["aktion"] == "notiz_zu_todo":
             gesuchter_titel = result.get("titel", "")
-            notiz_text = result.get("notiz", "")
+            notiz_text      = result.get("notiz", "")
             treffer = next((t for t in offene if t["titel"] == gesuchter_titel), None)
             if not treffer:
                 treffer = next((t for t in offene if gesuchter_titel.lower() in t["titel"].lower()), None)
@@ -188,7 +192,7 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 als_erledigt_markieren(treffer["id"])
                 await msg.edit_text(f"✅ Erledigt: {treffer['titel']}")
             else:
-                await msg.edit_text("Kein passendes To-do gefunden. Nutze /erledigt zum manuellen Abhaken.")
+                await msg.edit_text(f"Transkription:\n{text}\n\nKein passendes To-do gefunden. Nutze /erledigt zum manuellen Abhaken.")
 
     except Exception as e:
         await msg.edit_text(f"Fehler: {e}")
