@@ -19,6 +19,7 @@ ZEITZONE      = pytz.timezone("Europe/Berlin")
 CHAT_IDS_FILE = "/tmp/chat_ids.txt"
 KATEGORIEN    = ["Marketing", "Finanzen", "Operations", "Produkt", "Sonstiges"]
 chat_ids      = set()
+letzte_aktion = {}  # speichert letzte Aktion für Rückgängig
 
 
 # ── Chat-ID speichern ────────────────────────────────────────
@@ -61,19 +62,21 @@ Sprachnachricht: "{text}"
 Offene To-dos:
 {offene_str}
 
+WICHTIGE REGEL: Nutze "notiz_zu_todo" NUR wenn der Nutzer eindeutig einen bestehenden To-do beim Namen nennt oder sehr klar auf einen bestimmten bezieht (z.B. "zur Aufgabe X", "beim To-do Y", "bezüglich Z"). Wenn unklar ist welcher To-do gemeint ist → nutze "neu_notiz".
+
 Wähle eines dieser Formate:
 
 Neue Aufgabe(n):
 {{"aktion": "neu_todo", "todos": [{{"titel": "Aufgabe", "prioritaet": "wichtig", "faelligkeit": "2024-01-15", "kategorie": "Marketing"}}]}}
 - prioritaet: "wichtig" oder "neutral"
-- faelligkeit: ISO-Datum NUR wenn ein Zeitraum/Datum genannt wird (morgen, übermorgen, in X Tagen, nächste Woche, DD.MM.YYYY etc.), sonst null
+- faelligkeit: ISO-Datum NUR wenn ein Zeitraum/Datum genannt wird, sonst null
 - kategorie: eine aus [{kategorien_str}] wenn erkennbar, sonst null
 
-Neue Notiz:
+Neue Notiz (bei Zweifeln immer diese Option wählen):
 {{"aktion": "neu_notiz", "titel": "kurzer Titel", "inhalt": "vollständiger Text"}}
 
-Notiz zu bestehendem To-do:
-{{"aktion": "notiz_zu_todo", "titel": "Titel aus der Liste", "notiz": "Text"}}
+Notiz zu bestehendem To-do (NUR wenn To-do klar beim Namen genannt):
+{{"aktion": "notiz_zu_todo", "titel": "exakter Titel aus der Liste", "notiz": "Text"}}
 
 Aufgabe erledigt:
 {{"aktion": "erledigt", "titel": "Titel aus der Liste"}}
@@ -110,7 +113,7 @@ def datum_anzeige(iso_datum: str | None) -> str:
         return ""
 
 def todo_hinzufügen(titel: str, prioritaet: str = "neutral",
-                    faelligkeit: str = None, kategorie: str = None):
+                    faelligkeit: str = None, kategorie: str = None) -> str:
     props = {
         "Name":      {"title":    [{"text": {"content": titel}}]},
         "Erledigt":  {"checkbox": False},
@@ -121,10 +124,11 @@ def todo_hinzufügen(titel: str, prioritaet: str = "neutral",
         props["Fälligkeit"] = {"date": {"start": faelligkeit}}
     if kategorie and kategorie in KATEGORIEN:
         props["Kategorie"] = {"select": {"name": kategorie}}
-    notion.pages.create(parent={"database_id": DB}, properties=props)
+    seite = notion.pages.create(parent={"database_id": DB}, properties=props)
+    return seite["id"]
 
-def notiz_hinzufügen(titel: str, inhalt: str):
-    notion.pages.create(
+def notiz_hinzufügen(titel: str, inhalt: str) -> str:
+    seite = notion.pages.create(
         parent={"database_id": DB},
         properties={
             "Name":    {"title":     [{"text": {"content": titel}}]},
@@ -132,8 +136,10 @@ def notiz_hinzufügen(titel: str, inhalt: str):
             "Notizen": {"rich_text": [{"text": {"content": inhalt}}]},
         }
     )
+    return seite["id"]
 
-def notiz_zu_todo_hinzufügen(page_id: str, neue_notiz: str):
+def notiz_zu_todo_hinzufügen(page_id: str, neue_notiz: str) -> str:
+    """Gibt die alte Notiz zurück (für Rückgängig)."""
     seite      = notion.pages.retrieve(page_id=page_id)
     alte_notiz = ""
     try:
@@ -145,6 +151,7 @@ def notiz_zu_todo_hinzufügen(page_id: str, neue_notiz: str):
         page_id=page_id,
         properties={"Notizen": {"rich_text": [{"text": {"content": kombiniert}}]}}
     )
+    return alte_notiz  # für Rückgängig
 
 def offene_todos() -> list[dict]:
     seiten = notion.databases.query(
@@ -186,6 +193,12 @@ def offene_todos() -> list[dict]:
 
 def als_erledigt_markieren(page_id: str):
     notion.pages.update(page_id=page_id, properties={"Erledigt": {"checkbox": True}})
+
+def als_offen_markieren(page_id: str):
+    notion.pages.update(page_id=page_id, properties={"Erledigt": {"checkbox": False}})
+
+def archivieren(page_id: str):
+    notion.pages.update(page_id=page_id, archived=True)
 
 def todos_als_liste_text(todos: list[dict], nummeriert: bool = True) -> str:
     zeilen = []
@@ -230,6 +243,7 @@ Format:
 # ── Telegram Handler ─────────────────────────────────────────
 
 async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global letzte_aktion
     speichere_chat_id(update.effective_chat.id)
     msg   = await update.message.reply_text("Verarbeite...")
     voice = update.message.voice or update.message.audio
@@ -246,13 +260,16 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not todos:
                 await msg.edit_text(f"Transkription:\n{text}\n\nKeine To-dos erkannt.")
                 return
+            page_ids = []
             for todo in todos:
-                todo_hinzufügen(
+                pid = todo_hinzufügen(
                     todo["titel"],
                     todo.get("prioritaet", "neutral"),
                     todo.get("faelligkeit"),
                     todo.get("kategorie"),
                 )
+                page_ids.append(pid)
+            letzte_aktion = {"typ": "neu_todo", "page_ids": page_ids, "titel": [t["titel"] for t in todos]}
             zeilen = []
             for todo in todos:
                 emoji  = "🔴" if todo.get("prioritaet") == "wichtig" else "⚪"
@@ -265,11 +282,18 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if extras:
                     zeile += "  " + " ".join(extras)
                 zeilen.append(zeile)
-            await msg.edit_text(f"✅ {len(todos)} To-do(s) hinzugefügt:\n\n" + "\n".join(zeilen))
+            await msg.edit_text(
+                f"✅ {len(todos)} To-do(s) hinzugefügt:\n\n" + "\n".join(zeilen) +
+                "\n\n_/rueckgaengig zum Rückgängigmachen_"
+            )
 
         elif result["aktion"] == "neu_notiz":
-            notiz_hinzufügen(result["titel"], result["inhalt"])
-            await msg.edit_text(f"📝 Notiz gespeichert:\n\n{result['inhalt']}")
+            pid = notiz_hinzufügen(result["titel"], result["inhalt"])
+            letzte_aktion = {"typ": "neu_notiz", "page_id": pid, "titel": result["titel"]}
+            await msg.edit_text(
+                f"📝 Notiz gespeichert:\n\n{result['inhalt']}" +
+                "\n\n_/rueckgaengig zum Rückgängigmachen_"
+            )
 
         elif result["aktion"] == "notiz_zu_todo":
             gesuchter_titel = result.get("titel", "")
@@ -278,8 +302,17 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not treffer:
                 treffer = next((t for t in offene if gesuchter_titel.lower() in t["titel"].lower()), None)
             if treffer:
-                notiz_zu_todo_hinzufügen(treffer["id"], notiz_text)
-                await msg.edit_text(f"📝 Notiz zu '{treffer['titel']}' ergänzt:\n\n{notiz_text}")
+                alte_notiz = notiz_zu_todo_hinzufügen(treffer["id"], notiz_text)
+                letzte_aktion = {
+                    "typ":        "notiz_zu_todo",
+                    "page_id":    treffer["id"],
+                    "alte_notiz": alte_notiz,
+                    "titel":      treffer["titel"],
+                }
+                await msg.edit_text(
+                    f"📝 Notiz zu '{treffer['titel']}' ergänzt:\n\n{notiz_text}" +
+                    "\n\n_/rueckgaengig zum Rückgängigmachen_"
+                )
             else:
                 await msg.edit_text("Kein passendes To-do gefunden. Nutze /liste.")
 
@@ -290,7 +323,11 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 treffer = next((t for t in offene if gesuchter_titel.lower() in t["titel"].lower()), None)
             if treffer:
                 als_erledigt_markieren(treffer["id"])
-                await msg.edit_text(f"✅ Erledigt: {treffer['titel']}")
+                letzte_aktion = {"typ": "erledigt", "page_id": treffer["id"], "titel": treffer["titel"]}
+                await msg.edit_text(
+                    f"✅ Erledigt: {treffer['titel']}" +
+                    "\n\n_/rueckgaengig zum Rückgängigmachen_"
+                )
             else:
                 await msg.edit_text(
                     f"Transkription:\n{text}\n\nKein passendes To-do gefunden. Nutze /erledigt."
@@ -300,6 +337,45 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"Fehler: {e}")
     finally:
         os.remove(path)
+
+async def cmd_rueckgaengig(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global letzte_aktion
+    if not letzte_aktion:
+        await update.message.reply_text("Keine Aktion zum Rückgängigmachen vorhanden.")
+        return
+    try:
+        typ = letzte_aktion["typ"]
+
+        if typ == "neu_todo":
+            for pid in letzte_aktion["page_ids"]:
+                archivieren(pid)
+            titel = ", ".join(letzte_aktion["titel"])
+            await update.message.reply_text(f"↩️ To-do(s) gelöscht: {titel}")
+
+        elif typ == "neu_notiz":
+            archivieren(letzte_aktion["page_id"])
+            await update.message.reply_text(f"↩️ Notiz gelöscht: {letzte_aktion['titel']}")
+
+        elif typ == "notiz_zu_todo":
+            alte = letzte_aktion["alte_notiz"]
+            notion.pages.update(
+                page_id=letzte_aktion["page_id"],
+                properties={"Notizen": {"rich_text": [{"text": {"content": alte}}] if alte else []}}
+            )
+            await update.message.reply_text(
+                f"↩️ Notiz bei '{letzte_aktion['titel']}' zurückgesetzt."
+            )
+
+        elif typ == "erledigt":
+            als_offen_markieren(letzte_aktion["page_id"])
+            await update.message.reply_text(
+                f"↩️ '{letzte_aktion['titel']}' wieder als offen markiert."
+            )
+
+        letzte_aktion = {}
+
+    except Exception as e:
+        await update.message.reply_text(f"Fehler beim Rückgängigmachen: {e}")
 
 async def textnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     speichere_chat_id(update.effective_chat.id)
@@ -313,7 +389,8 @@ async def textnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if 1 <= n <= len(todos):
                 todo = todos[n - 1]
                 als_erledigt_markieren(todo["id"])
-                await update.message.reply_text(f"✅ Erledigt: {todo['titel']}")
+                letzte_aktion.update({"typ": "erledigt", "page_id": todo["id"], "titel": todo["titel"]})
+                await update.message.reply_text(f"✅ Erledigt: {todo['titel']}\n\n_/rueckgaengig zum Rückgängigmachen_")
             else:
                 await update.message.reply_text(
                     f"Nummer {n} existiert nicht. Du hast {len(todos)} offene To-dos."
@@ -334,8 +411,9 @@ async def textnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if 1 <= n <= len(gespeichert):
             todo = gespeichert[n - 1]
             als_erledigt_markieren(todo["id"])
+            letzte_aktion.update({"typ": "erledigt", "page_id": todo["id"], "titel": todo["titel"]})
             ctx.user_data.pop("todo_liste", None)
-            await update.message.reply_text(f"✅ Erledigt: {todo['titel']}")
+            await update.message.reply_text(f"✅ Erledigt: {todo['titel']}\n\n_/rueckgaengig zum Rückgängigmachen_")
         else:
             await update.message.reply_text(
                 "Nummer nicht gefunden. Tippe 'erledigt' für die aktuelle Liste."
@@ -348,6 +426,7 @@ async def textnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/heute – dringende To-dos\n"
         "/briefing – KI-Tagesplan\n"
         "/erledigt – Aufgabe abhaken\n"
+        "/rueckgaengig – letzte Aktion rückgängig\n"
         "'erledigt 1' – direkt abhaken"
     )
 
@@ -361,6 +440,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/heute – dringende & heutige To-dos\n"
         "/briefing – KI-Tagesplan (Top 3)\n"
         "/erledigt – Aufgabe abhaken\n"
+        "/rueckgaengig – letzte Aktion rückgängig\n"
         "'erledigt 1' – direkt abhaken"
     )
 
@@ -446,7 +526,6 @@ async def abend_zusammenfassung(ctx: ContextTypes.DEFAULT_TYPE):
         await ctx.bot.send_message(chat_id=cid, text=text)
 
 async def wochen_review(ctx: ContextTypes.DEFAULT_TYPE):
-    # Nur sonntags ausführen (6 = Sonntag in Python)
     if datetime.now(ZEITZONE).weekday() != 6:
         return
     todos      = offene_todos()
@@ -475,11 +554,12 @@ def main():
     lade_chat_ids()
     app = ApplicationBuilder().token(os.environ["TELEGRAM_TOKEN"]).build()
 
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("liste",    cmd_liste))
-    app.add_handler(CommandHandler("heute",    cmd_heute))
-    app.add_handler(CommandHandler("erledigt", cmd_erledigt))
-    app.add_handler(CommandHandler("briefing", cmd_briefing))
+    app.add_handler(CommandHandler("start",        cmd_start))
+    app.add_handler(CommandHandler("liste",        cmd_liste))
+    app.add_handler(CommandHandler("heute",        cmd_heute))
+    app.add_handler(CommandHandler("erledigt",     cmd_erledigt))
+    app.add_handler(CommandHandler("briefing",     cmd_briefing))
+    app.add_handler(CommandHandler("rueckgaengig", cmd_rueckgaengig))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, sprachnachricht))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, textnachricht))
 
