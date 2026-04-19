@@ -1,6 +1,6 @@
 import os, json, base64
 import pytz
-from datetime import time as dtime, datetime
+from datetime import time as dtime, datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -15,11 +15,12 @@ claude = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 notion = NotionClient(auth=os.environ["NOTION_TOKEN"])
 DB     = os.environ["NOTION_DATABASE_ID"]
 
-ZEITZONE      = pytz.timezone("Europe/Berlin")
-CHAT_IDS_FILE = "/tmp/chat_ids.txt"
-KATEGORIEN    = ["Marketing", "Finanzen", "Operations", "Produkt", "Sonstiges"]
-chat_ids      = set()
-letzte_aktion = {}
+ZEITZONE           = pytz.timezone("Europe/Berlin")
+CHAT_IDS_FILE      = "/tmp/chat_ids.txt"
+ERINNERUNGEN_FILE  = "/tmp/erinnerungen.json"
+KATEGORIEN         = ["Marketing", "Finanzen", "Operations", "Produkt", "Sonstiges"]
+chat_ids           = set()
+letzte_aktion      = {}
 
 HAUPTMENU = ReplyKeyboardMarkup(
     [
@@ -52,6 +53,29 @@ def speichere_chat_id(chat_id: int):
         chat_ids.add(chat_id)
         with open(CHAT_IDS_FILE, "a") as f:
             f.write(f"{chat_id}\n")
+
+
+# ── Erinnerungen (Persistenz) ────────────────────────────────
+
+def erinnerungen_laden() -> list:
+    if os.path.exists(ERINNERUNGEN_FILE):
+        try:
+            with open(ERINNERUNGEN_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def erinnerung_speichern(chat_id: int, titel: str, dt_iso: str):
+    liste = erinnerungen_laden()
+    liste.append({"chat_id": chat_id, "titel": titel, "dt": dt_iso})
+    with open(ERINNERUNGEN_FILE, "w") as f:
+        json.dump(liste, f)
+
+def erinnerung_entfernen(dt_iso: str):
+    liste = [e for e in erinnerungen_laden() if e["dt"] != dt_iso]
+    with open(ERINNERUNGEN_FILE, "w") as f:
+        json.dump(liste, f)
 
 
 # ── Kernfunktionen ───────────────────────────────────────────
@@ -99,14 +123,22 @@ Notiz zu bestehendem To-do (NUR mit Schlüsselwort notiz/füg hinzu/ergänze):
 Aufgabe erledigt:
 {{"aktion": "erledigt", "titel": "Titel aus Liste"}}
 
+Aufgabe löschen (wenn "lösche", "entferne", "streiche" gesagt wird):
+{{"aktion": "loeschen", "titel": "Titel aus Liste"}}
+
 Aufgabe verschieben (wenn "verschiebe", "verlege", "auf [Datum]" gesagt wird):
 {{"aktion": "verschieben", "titel": "Titel aus Liste", "faelligkeit": "2024-01-20"}}
 
-Priorität ändern (wenn "markiere als wichtig/neutral", "ist wichtig/unwichtig" gesagt wird):
+Priorität ändern:
 {{"aktion": "prioritaet_aendern", "titel": "Titel aus Liste", "prioritaet": "wichtig"}}
 
 Wochenfokus setzen (wenn "fokus", "Schwerpunkt", "Wochenziel" gesagt wird):
 {{"aktion": "fokus_setzen", "titel": "Titel aus Liste oder neue Aufgabe"}}
+
+Erinnerung setzen (wenn "erinnere mich", "reminder", "um [Zeit]" gesagt wird):
+{{"aktion": "erinnerung", "titel": "Titel aus Liste oder Beschreibung", "zeit": "14:00", "datum": "{heute}"}}
+- zeit: Uhrzeit im Format HH:MM
+- datum: ISO-Datum, heute wenn nicht anders genannt
 
 Nur JSON, kein anderer Text."""}]
     )
@@ -255,11 +287,9 @@ def aktueller_fokus() -> dict | None:
             {"property": "Erledigt", "checkbox": {"equals": False}},
         ]}
     )["results"]
-    if not seiten:
+    if not seiten or not seiten[0]["properties"]["Name"]["title"]:
         return None
     s = seiten[0]
-    if not s["properties"]["Name"]["title"]:
-        return None
     return {"id": s["id"], "titel": s["properties"]["Name"]["title"][0]["plain_text"]}
 
 def alle_fokus_loeschen():
@@ -281,6 +311,9 @@ def als_offen_markieren(page_id: str):
 
 def archivieren(page_id: str):
     notion.pages.update(page_id=page_id, archived=True)
+
+def unarchivieren(page_id: str):
+    notion.pages.update(page_id=page_id, archived=False)
 
 def todos_als_liste_text(todos: list[dict], nummeriert: bool = True) -> str:
     zeilen = []
@@ -340,6 +373,18 @@ async def foto_analysieren(path: str, caption: str = "") -> str:
     return r.content[0].text.strip()
 
 
+# ── Erinnerungs-Callback ─────────────────────────────────────
+
+async def erinnerungs_callback(ctx: ContextTypes.DEFAULT_TYPE):
+    data   = ctx.job.data
+    erinnerung_entfernen(data.get("dt_iso", ""))
+    await ctx.bot.send_message(
+        chat_id=data["chat_id"],
+        text=f"⏰ Erinnerung!\n\n{data['titel']}",
+        reply_markup=HAUPTMENU
+    )
+
+
 # ── Telegram Handler ─────────────────────────────────────────
 
 async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -390,10 +435,7 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif result["aktion"] == "neu_notiz":
             pid = notiz_hinzufügen(result["titel"], result["inhalt"])
             letzte_aktion = {"typ": "neu_notiz", "page_id": pid, "titel": result["titel"]}
-            await msg.edit_text(
-                f"📝 Notiz gespeichert:\n\n{result['inhalt']}",
-                reply_markup=undo_button()
-            )
+            await msg.edit_text(f"📝 Notiz gespeichert:\n\n{result['inhalt']}", reply_markup=undo_button())
 
         elif result["aktion"] == "neu_idee":
             pid = idee_hinzufügen(result["titel"], result["inhalt"])
@@ -420,7 +462,7 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     reply_markup=undo_button()
                 )
             else:
-                await msg.edit_text("Kein passendes To-do gefunden. Nutze /liste.")
+                await msg.edit_text("Kein passendes To-do gefunden.")
 
         elif result["aktion"] == "erledigt":
             gesuchter_titel = result.get("titel", "")
@@ -432,7 +474,19 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 letzte_aktion = {"typ": "erledigt", "page_id": treffer["id"], "titel": treffer["titel"]}
                 await msg.edit_text(f"✅ Erledigt: {treffer['titel']}", reply_markup=undo_button())
             else:
-                await msg.edit_text(f"Transkription:\n{text}\n\nKein passendes To-do gefunden. Nutze /erledigt.")
+                await msg.edit_text(f"Transkription:\n{text}\n\nKein passendes To-do gefunden.")
+
+        elif result["aktion"] == "loeschen":
+            gesuchter_titel = result.get("titel", "")
+            treffer = next((t for t in offene if t["titel"] == gesuchter_titel), None)
+            if not treffer:
+                treffer = next((t for t in offene if gesuchter_titel.lower() in t["titel"].lower()), None)
+            if treffer:
+                archivieren(treffer["id"])
+                letzte_aktion = {"typ": "loeschen", "page_id": treffer["id"], "titel": treffer["titel"]}
+                await msg.edit_text(f"🗑️ Gelöscht: {treffer['titel']}", reply_markup=undo_button())
+            else:
+                await msg.edit_text("Kein passendes To-do gefunden.")
 
         elif result["aktion"] == "verschieben":
             gesuchter_titel  = result.get("titel", "")
@@ -454,7 +508,7 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     reply_markup=undo_button()
                 )
             else:
-                await msg.edit_text("Kein passendes To-do gefunden oder kein Datum erkannt.")
+                await msg.edit_text("Kein passendes To-do oder kein Datum erkannt.")
 
         elif result["aktion"] == "prioritaet_aendern":
             gesuchter_titel = result.get("titel", "")
@@ -488,13 +542,44 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 alle_fokus_loeschen()
                 fokus_setzen_by_id(treffer["id"])
                 letzte_aktion = {"typ": "fokus_setzen", "page_id": treffer["id"], "titel": treffer["titel"]}
-                await msg.edit_text(f"🎯 Wochenfokus gesetzt: {treffer['titel']}", reply_markup=undo_button())
+                await msg.edit_text(f"🎯 Wochenfokus: {treffer['titel']}", reply_markup=undo_button())
             else:
                 pid = todo_hinzufügen(gesuchter_titel, "wichtig")
                 alle_fokus_loeschen()
                 fokus_setzen_by_id(pid)
                 letzte_aktion = {"typ": "fokus_setzen_neu", "page_id": pid, "titel": gesuchter_titel}
-                await msg.edit_text(f"🎯 Wochenfokus (neue Aufgabe): {gesuchter_titel}", reply_markup=undo_button())
+                await msg.edit_text(f"🎯 Wochenfokus (neu): {gesuchter_titel}", reply_markup=undo_button())
+
+        elif result["aktion"] == "erinnerung":
+            titel = result.get("titel", "Erinnerung")
+            zeit  = result.get("zeit", "")
+            datum = result.get("datum", datetime.now(ZEITZONE).strftime("%Y-%m-%d"))
+            if not zeit:
+                await msg.edit_text("Keine Uhrzeit erkannt. Sag z.B. 'Erinnere mich um 14 Uhr'.")
+                return
+            try:
+                erinnerungs_dt = ZEITZONE.localize(
+                    datetime.strptime(f"{datum} {zeit}", "%Y-%m-%d %H:%M")
+                )
+                # Wenn Zeit bereits vorbei → morgen
+                if erinnerungs_dt <= datetime.now(ZEITZONE):
+                    erinnerungs_dt += timedelta(days=1)
+                dt_iso   = erinnerungs_dt.isoformat()
+                chat_id  = update.effective_chat.id
+                erinnerung_speichern(chat_id, titel, dt_iso)
+                ctx.job_queue.run_once(
+                    erinnerungs_callback,
+                    when=erinnerungs_dt,
+                    data={"chat_id": chat_id, "titel": titel, "dt_iso": dt_iso},
+                    name=f"erinnerung_{dt_iso}"
+                )
+                await msg.edit_text(
+                    f"⏰ Erinnerung gesetzt:\n\n{titel}\n📅 {erinnerungs_dt.strftime('%d.%m. um %H:%M Uhr')}",
+                    reply_markup=undo_button()
+                )
+                letzte_aktion = {"typ": "erinnerung", "dt_iso": dt_iso, "titel": titel, "name": f"erinnerung_{dt_iso}"}
+            except Exception as e:
+                await msg.edit_text(f"Fehler beim Setzen der Erinnerung: {e}")
 
     except Exception as e:
         await msg.edit_text(f"Fehler: {e}")
@@ -515,10 +600,7 @@ async def foto_nachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         titel        = caption[:50] if caption else f"Screenshot {datetime.now(ZEITZONE).strftime('%d.%m. %H:%M')}"
         pid          = notiz_hinzufügen(titel, beschreibung)
         letzte_aktion = {"typ": "neu_notiz", "page_id": pid, "titel": titel}
-        await msg.edit_text(
-            f"📸 Screenshot als Notiz gespeichert:\n\n{beschreibung}",
-            reply_markup=undo_button()
-        )
+        await msg.edit_text(f"📸 Screenshot gespeichert:\n\n{beschreibung}", reply_markup=undo_button())
     except Exception as e:
         await msg.edit_text(f"Fehler: {e}")
     finally:
@@ -550,6 +632,9 @@ async def callback_rueckgaengig(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif typ == "erledigt":
             als_offen_markieren(letzte_aktion["page_id"])
             await query.edit_message_text(f"↩️ '{letzte_aktion['titel']}' wieder geöffnet.")
+        elif typ == "loeschen":
+            unarchivieren(letzte_aktion["page_id"])
+            await query.edit_message_text(f"↩️ '{letzte_aktion['titel']}' wiederhergestellt.")
         elif typ == "verschieben":
             alte = letzte_aktion.get("alte_faelligkeit")
             notion.pages.update(
@@ -569,6 +654,13 @@ async def callback_rueckgaengig(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif typ == "fokus_setzen_neu":
             archivieren(letzte_aktion["page_id"])
             await query.edit_message_text("↩️ Fokus-Aufgabe gelöscht.")
+        elif typ == "erinnerung":
+            erinnerung_entfernen(letzte_aktion["dt_iso"])
+            # Job aus Queue entfernen
+            jobs = ctx.job_queue.get_jobs_by_name(letzte_aktion["name"])
+            for job in jobs:
+                job.schedule_removal()
+            await query.edit_message_text(f"↩️ Erinnerung '{letzte_aktion['titel']}' gelöscht.")
         letzte_aktion = {}
     except Exception as e:
         await query.edit_message_text(f"Fehler: {e}")
@@ -578,7 +670,6 @@ async def textnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text  = update.message.text.strip().lower()
     todos = offene_todos()
 
-    # Fokus-Auswahl per Nummer
     if text.isdigit() and ctx.user_data.get("warte_auf_fokus"):
         n           = int(text)
         gespeichert = ctx.user_data.get("todo_liste", todos)
@@ -593,7 +684,6 @@ async def textnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Nummer {n} existiert nicht.", reply_markup=HAUPTMENU)
         return
 
-    # Erledigt
     if text.startswith("erledigt"):
         teile = text.split()
         if len(teile) == 2 and teile[1].isdigit():
@@ -618,7 +708,6 @@ async def textnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Allgemeine Zahl
     if text.isdigit():
         n           = int(text)
         gespeichert = ctx.user_data.get("todo_liste", todos)
@@ -630,12 +719,12 @@ async def textnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ Erledigt: {todo['titel']}", reply_markup=undo_button())
         else:
             await update.message.reply_text(
-                "Nummer nicht gefunden. Tippe 'erledigt' für die aktuelle Liste.", reply_markup=HAUPTMENU
+                "Nummer nicht gefunden. Tippe 'erledigt' für die Liste.", reply_markup=HAUPTMENU
             )
         return
 
     await update.message.reply_text(
-        "Schick mir eine Sprachnachricht oder ein Foto.\nNutze die Buttons unten für schnellen Zugriff.",
+        "Schick mir eine Sprachnachricht oder ein Foto.\nNutze die Buttons unten.",
         reply_markup=HAUPTMENU
     )
 
@@ -644,12 +733,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Hey! Ich bin dein To-do Bot.\n\n"
         "📱 Sprachbefehle:\n"
-        "• Aufgabe ansagen → wird als To-do gespeichert\n"
-        "• 'Verschiebe [X] auf morgen' → Datum ändern\n"
-        "• 'Markiere [X] als wichtig' → Priorität ändern\n"
-        "• 'Fokus: [X]' → Wochenfokus setzen\n"
-        "• 'Idee: [X]' → Idee speichern\n\n"
-        "📸 Foto schicken → wird als Notiz mit KI-Beschreibung gespeichert\n\n"
+        "• Aufgabe ansagen → To-do\n"
+        "• 'Lösche [X]' → Aufgabe löschen\n"
+        "• 'Erinnere mich an [X] um 14 Uhr' → Erinnerung\n"
+        "• 'Verschiebe [X] auf morgen'\n"
+        "• 'Markiere [X] als wichtig'\n"
+        "• 'Fokus: [X]' → Wochenfokus\n"
+        "• 'Idee: [X]'\n\n"
+        "📸 Foto schicken → KI-Beschreibung als Notiz\n\n"
         "Buttons unten für schnellen Zugriff.",
         reply_markup=HAUPTMENU
     )
@@ -673,7 +764,7 @@ async def cmd_heute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         or (not t.get("faelligkeit") and t["prioritaet"] == "Wichtig")
     ]
     if not relevant:
-        await update.message.reply_text("Heute nichts Dringendes! 🎉\nNutze /liste für alle.", reply_markup=HAUPTMENU)
+        await update.message.reply_text("Heute nichts Dringendes! 🎉", reply_markup=HAUPTMENU)
         return
     await update.message.reply_text(f"📅 Heute relevant:\n\n{todos_als_liste_text(relevant)}", reply_markup=HAUPTMENU)
 
@@ -694,7 +785,7 @@ async def cmd_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg   = await update.message.reply_text("Analysiere deine To-dos...", reply_markup=HAUPTMENU)
     todos = offene_todos()
     if not todos:
-        await msg.edit_text("Keine offenen To-dos – du bist up to date! 🎉")
+        await msg.edit_text("Keine offenen To-dos! 🎉")
         return
     await msg.edit_text(await ki_top3(todos))
 
@@ -708,13 +799,13 @@ async def cmd_ideen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     zeilen = []
     for idee in ideen:
-                zeile = f"💡 {idee['titel']}"
+        zeile = f"💡 {idee['titel']}"
         if idee["inhalt"]:
             preview = idee["inhalt"][:80] + ("..." if len(idee["inhalt"]) > 80 else "")
-            zeile += f"\n   {preview}"
+            zeile  += f"\n   {preview}"
         zeilen.append(zeile)
     await update.message.reply_text(
-        f"💡 Ideen-Sammlung ({len(ideen)}):\n\n" + "\n\n".join(zeilen), reply_markup=HAUPTMENU
+        f"💡 Ideen ({len(ideen)}):\n\n" + "\n\n".join(zeilen), reply_markup=HAUPTMENU
     )
 
 async def cmd_fokus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -736,7 +827,7 @@ async def cmd_fokus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_suche(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     speichere_chat_id(update.effective_chat.id)
     if not ctx.args:
-        await update.message.reply_text("Nutze: /suche [Begriff]\nBeispiel: /suche Lieferant", reply_markup=HAUPTMENU)
+        await update.message.reply_text("Nutze: /suche [Begriff]", reply_markup=HAUPTMENU)
         return
     suchbegriff = " ".join(ctx.args)
     ergebnisse  = notion.databases.query(
@@ -750,11 +841,11 @@ async def cmd_suche(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for s in ergebnisse:
         if not s["properties"]["Name"]["title"]:
             continue
-        titel    = s["properties"]["Name"]["title"][0]["plain_text"]
-        typ_sel  = (s["properties"].get("Typ") or {}).get("select") or {}
-        typ      = typ_sel.get("name", "?")
+        titel   = s["properties"]["Name"]["title"][0]["plain_text"]
+        typ_sel = (s["properties"].get("Typ") or {}).get("select") or {}
+        typ     = typ_sel.get("name", "?")
         erledigt = s["properties"].get("Erledigt", {}).get("checkbox", False)
-        status   = "✅" if erledigt else ("💡" if typ == "Idee" else ("📝" if typ == "Notiz" else "⬜"))
+        status  = "✅" if erledigt else ("💡" if typ == "Idee" else ("📝" if typ == "Notiz" else "⬜"))
         zeilen.append(f"{status} [{typ}] {titel}")
     await update.message.reply_text(
         f"🔍 '{suchbegriff}' – {len(zeilen)} Ergebnis(se):\n\n" + "\n".join(zeilen), reply_markup=HAUPTMENU
@@ -771,7 +862,7 @@ async def morgen_erinnerung(ctx: ContextTypes.DEFAULT_TYPE):
     if fokus:
         teile.append(f"\n🎯 Wochenfokus: {fokus['titel']}")
     elif ist_montag:
-        teile.append("\n🎯 Es ist Montag! Setze deinen Wochenfokus mit /fokus oder per Sprache.")
+        teile.append("\n🎯 Es ist Montag! Setze deinen Wochenfokus mit /fokus.")
     if überfällig:
         teile.append(f"\n⚠️ Überfällig ({len(überfällig)}):")
         teile.append(todos_als_liste_text(überfällig, nummeriert=False))
@@ -781,9 +872,8 @@ async def morgen_erinnerung(ctx: ContextTypes.DEFAULT_TYPE):
     top3 = await ki_top3(todos)
     if top3:
         teile.append(f"\n{top3}")
-    text = "\n".join(teile)
     for cid in chat_ids:
-        await ctx.bot.send_message(chat_id=cid, text=text)
+        await ctx.bot.send_message(chat_id=cid, text="\n".join(teile))
 
 async def abend_zusammenfassung(ctx: ContextTypes.DEFAULT_TYPE):
     todos      = offene_todos()
@@ -796,7 +886,7 @@ async def abend_zusammenfassung(ctx: ContextTypes.DEFAULT_TYPE):
         if überfällig:
             teile.append("\n⚠️ Überfällig – morgen angehen:")
             teile.append(todos_als_liste_text(überfällig, nummeriert=False))
-        teile.append("\n📋 Alle offenen To-dos:")
+        teile.append("\n📋 Alle To-dos:")
         teile.append(todos_als_liste_text(todos))
         text = "\n".join(teile)
     for cid in chat_ids:
@@ -809,24 +899,43 @@ async def wochen_review(ctx: ContextTypes.DEFAULT_TYPE):
     heute_str  = datetime.now(ZEITZONE).strftime("%Y-%m-%d")
     überfällig = [t for t in todos if t.get("faelligkeit") and t["faelligkeit"] < heute_str]
     wichtige   = [t for t in todos if t["prioritaet"] == "Wichtig"]
-    teile      = ["📊 Wöchentlicher Review\n", f"📋 Offene To-dos gesamt: {len(todos)}"]
+    teile      = ["📊 Wöchentlicher Review\n", f"📋 Offene To-dos: {len(todos)}"]
     if überfällig:
-        teile.append(f"⚠️ Davon überfällig: {len(überfällig)}")
-    teile.append(f"🔴 Wichtige Aufgaben: {len(wichtige)}")
+        teile.append(f"⚠️ Überfällig: {len(überfällig)}")
+    teile.append(f"🔴 Wichtige: {len(wichtige)}")
     if todos:
-        teile.append("\nAlle offenen To-dos:")
+        teile.append("\nAlle To-dos:")
         teile.append(todos_als_liste_text(todos))
     teile.append("\n💪 Neue Woche – frischer Start!")
-    text = "\n".join(teile)
     for cid in chat_ids:
-        await ctx.bot.send_message(chat_id=cid, text=text)
+        await ctx.bot.send_message(chat_id=cid, text="\n".join(teile))
 
 
 # ── Start ────────────────────────────────────────────────────
 
+async def post_init(application):
+    """Lädt gespeicherte Erinnerungen nach Neustart."""
+    jetzt    = datetime.now(ZEITZONE)
+    gueltige = []
+    for e in erinnerungen_laden():
+        try:
+            dt = datetime.fromisoformat(e["dt"])
+            if dt > jetzt:
+                application.job_queue.run_once(
+                    erinnerungs_callback,
+                    when=dt,
+                    data={"chat_id": e["chat_id"], "titel": e["titel"], "dt_iso": e["dt"]},
+                    name=f"erinnerung_{e['dt']}"
+                )
+                gueltige.append(e)
+        except Exception:
+            pass
+    with open(ERINNERUNGEN_FILE, "w") as f:
+        json.dump(gueltige, f)
+
 def main():
     lade_chat_ids()
-    app = ApplicationBuilder().token(os.environ["TELEGRAM_TOKEN"]).build()
+    app = ApplicationBuilder().token(os.environ["TELEGRAM_TOKEN"]).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("liste",    cmd_liste))
