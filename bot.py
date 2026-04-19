@@ -134,10 +134,19 @@ def offene_todos() -> list[dict]:
             "titel":      s["properties"]["Name"]["title"][0]["plain_text"],
             "prioritaet": select.get("name", "Neutral"),
         })
+    # Wichtig zuerst
+    todos.sort(key=lambda t: 0 if t["prioritaet"] == "Wichtig" else 1)
     return todos
 
 def als_erledigt_markieren(page_id: str):
     notion.pages.update(page_id=page_id, properties={"Erledigt": {"checkbox": True}})
+
+def todos_als_liste_text(todos: list[dict]) -> str:
+    zeilen = []
+    for i, t in enumerate(todos, 1):
+        emoji = "🔴" if t["prioritaet"] == "Wichtig" else "⚪"
+        zeilen.append(f"{i}. {emoji} {t['titel']}")
+    return "\n".join(zeilen)
 
 
 # ── Telegram Handler ────────────────────────────────────────
@@ -192,12 +201,69 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 als_erledigt_markieren(treffer["id"])
                 await msg.edit_text(f"✅ Erledigt: {treffer['titel']}")
             else:
-                await msg.edit_text(f"Transkription:\n{text}\n\nKein passendes To-do gefunden. Nutze /erledigt zum manuellen Abhaken.")
+                await msg.edit_text(f"Transkription:\n{text}\n\nKein passendes To-do gefunden. Nutze /erledigt.")
 
     except Exception as e:
         await msg.edit_text(f"Fehler: {e}")
     finally:
         os.remove(path)
+
+
+async def textnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Verarbeitet Text-Eingaben: 'erledigt', 'erledigt 2', '1', '2', ..."""
+    speichere_chat_id(update.effective_chat.id)
+    text = update.message.text.strip().lower()
+
+    todos = offene_todos()
+
+    # ── "erledigt N" direkt in einem Schritt ──
+    if text.startswith("erledigt"):
+        teile = text.split()
+        if len(teile) == 2 and teile[1].isdigit():
+            n = int(teile[1])
+            if 1 <= n <= len(todos):
+                todo = todos[n - 1]
+                als_erledigt_markieren(todo["id"])
+                await update.message.reply_text(f"✅ Erledigt: {todo['titel']}")
+            else:
+                await update.message.reply_text(f"Nummer {n} existiert nicht. Du hast {len(todos)} offene To-dos.")
+            return
+
+        # ── nur "erledigt" → Liste anzeigen ──
+        if not todos:
+            await update.message.reply_text("Keine offenen To-dos! 🎉")
+            return
+        liste = todos_als_liste_text(todos)
+        ctx.user_data["todo_liste"] = todos
+        await update.message.reply_text(
+            f"Welche Aufgabe ist erledigt? Antworte mit der Nummer:\n\n{liste}"
+        )
+        return
+
+    # ── Nur eine Zahl eingegeben → aus gespeicherter Liste abhaken ──
+    if text.isdigit():
+        n = int(text)
+        # Frische Liste holen (falls zwischenzeitlich was geändert)
+        gespeichert = ctx.user_data.get("todo_liste", todos)
+        if 1 <= n <= len(gespeichert):
+            todo = gespeichert[n - 1]
+            als_erledigt_markieren(todo["id"])
+            ctx.user_data.pop("todo_liste", None)
+            await update.message.reply_text(f"✅ Erledigt: {todo['titel']}")
+        else:
+            await update.message.reply_text(
+                f"Nummer {n} existiert nicht. Tippe 'erledigt' um die aktuelle Liste zu sehen."
+            )
+        return
+
+    # ── Andere Textnachrichten ignorieren ──
+    await update.message.reply_text(
+        "Schick mir eine Sprachnachricht oder nutze:\n"
+        "/liste – offene To-dos\n"
+        "/erledigt – Aufgabe abhaken\n"
+        "'erledigt 1' – Aufgabe 1 direkt abhaken"
+    )
+
 
 async def cmd_erledigt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     speichere_chat_id(update.effective_chat.id)
@@ -205,24 +271,11 @@ async def cmd_erledigt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not todos:
         await update.message.reply_text("Keine offenen To-dos! 🎉")
         return
-    tasten = [[InlineKeyboardButton(
-        f"{'🔴 ' if t['prioritaet'] == 'Wichtig' else '⚪ '}{t['titel']}",
-        callback_data=t["id"]
-    )] for t in todos]
+    liste = todos_als_liste_text(todos)
+    ctx.user_data["todo_liste"] = todos
     await update.message.reply_text(
-        "Was hast du erledigt?",
-        reply_markup=InlineKeyboardMarkup(tasten)
+        f"Welche Aufgabe ist erledigt? Antworte mit der Nummer:\n\n{liste}"
     )
-
-async def erledigt_geklickt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    titel = next(
-        btn.text for row in q.message.reply_markup.inline_keyboard
-        for btn in row if btn.callback_data == q.data
-    )
-    als_erledigt_markieren(q.data)
-    await q.edit_message_text(f"✅ Erledigt: {titel}")
 
 async def cmd_liste(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     speichere_chat_id(update.effective_chat.id)
@@ -230,58 +283,66 @@ async def cmd_liste(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not todos:
         await update.message.reply_text("Keine offenen To-dos! 🎉")
         return
-    wichtige = [t for t in todos if t["prioritaet"] == "Wichtig"]
-    normale  = [t for t in todos if t["prioritaet"] != "Wichtig"]
-    text = ""
-    if wichtige:
-        text += "🔴 Wichtig:\n" + "\n".join(f"• {t['titel']}" for t in wichtige) + "\n\n"
-    if normale:
-        text += "⚪ Neutral:\n" + "\n".join(f"• {t['titel']}" for t in normale)
-    await update.message.reply_text(f"Offene To-dos:\n\n{text}")
+    liste = todos_als_liste_text(todos)
+    await update.message.reply_text(f"📋 Offene To-dos:\n\n{liste}")
 
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    speichere_chat_id(update.effective_chat.id)
+    await update.message.reply_text(
+        "👋 Hey! Ich bin dein To-do Bot.\n\n"
+        "Schick mir eine Sprachnachricht mit deinen Aufgaben oder Notizen.\n\n"
+        "Befehle:\n"
+        "/liste – offene To-dos\n"
+        "/erledigt – Aufgabe abhaken\n"
+        "Oder tippe 'erledigt 1' um Aufgabe 1 direkt abzuhaken."
+    )
 
-# ── Geplante Nachrichten ────────────────────────────────────
-
-async def morgen_erinnerung(ctx):
+async def morgen_erinnerung(ctx: ContextTypes.DEFAULT_TYPE):
     todos = offene_todos()
     if not todos:
-        nachricht = "☀️ Guten Morgen! Keine offenen To-dos. Freier Tag! 🎉"
+        text = "☀️ Guten Morgen! Heute keine offenen To-dos – freier Tag! 🎉"
     else:
         wichtige = [t for t in todos if t["prioritaet"] == "Wichtig"]
         normale  = [t for t in todos if t["prioritaet"] != "Wichtig"]
-        nachricht = f"☀️ Guten Morgen! Du hast {len(todos)} offene To-do(s):\n\n"
+        zeilen = []
         if wichtige:
-            nachricht += "🔴 Wichtig:\n" + "\n".join(f"• {t['titel']}" for t in wichtige) + "\n\n"
+            zeilen.append("🔴 Wichtig:")
+            zeilen += [f"  • {t['titel']}" for t in wichtige]
         if normale:
-            nachricht += "⚪ Neutral:\n" + "\n".join(f"• {t['titel']}" for t in normale)
-    for chat_id in chat_ids:
-        await ctx.bot.send_message(chat_id=chat_id, text=nachricht)
+            zeilen.append("⚪ Neutral:")
+            zeilen += [f"  • {t['titel']}" for t in normale]
+        text = f"☀️ Guten Morgen! Du hast {len(todos)} offene To-dos:\n\n" + "\n".join(zeilen)
+    for cid in chat_ids:
+        await ctx.bot.send_message(chat_id=cid, text=text)
 
-async def abend_zusammenfassung(ctx):
+async def abend_zusammenfassung(ctx: ContextTypes.DEFAULT_TYPE):
     todos = offene_todos()
-    nachricht = "🌙 Tages-Zusammenfassung\n\n"
     if not todos:
-        nachricht += "Alle To-dos erledigt — top! 🎉"
+        text = "🌙 Guten Abend! Alle To-dos erledigt – super gemacht! 🎉"
     else:
-        nachricht += f"Noch {len(todos)} offen:\n\n"
-        for t in todos:
-            emoji = "🔴" if t["prioritaet"] == "Wichtig" else "⚪"
-            nachricht += f"{emoji} {t['titel']}\n"
-    for chat_id in chat_ids:
-        await ctx.bot.send_message(chat_id=chat_id, text=nachricht)
+        liste = todos_als_liste_text(todos)
+        text = f"🌙 Guten Abend! Noch {len(todos)} offene To-dos:\n\n{liste}"
+    for cid in chat_ids:
+        await ctx.bot.send_message(chat_id=cid, text=text)
 
 
 # ── Start ───────────────────────────────────────────────────
 
-lade_chat_ids()
-app = ApplicationBuilder().token(os.environ["TELEGRAM_TOKEN"]).build()
+def main():
+    lade_chat_ids()
+    app = ApplicationBuilder().token(os.environ["TELEGRAM_TOKEN"]).build()
 
-app.job_queue.run_daily(morgen_erinnerung,     time=time(8,  0, tzinfo=ZEITZONE))
-app.job_queue.run_daily(abend_zusammenfassung, time=time(20, 0, tzinfo=ZEITZONE))
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("liste",    cmd_liste))
+    app.add_handler(CommandHandler("erledigt", cmd_erledigt))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, sprachnachricht))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, textnachricht))
 
-app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, sprachnachricht))
-app.add_handler(CommandHandler("erledigt", cmd_erledigt))
-app.add_handler(CommandHandler("liste", cmd_liste))
-app.add_handler(CallbackQueryHandler(erledigt_geklickt))
-print("Bot läuft...")
-app.run_polling()
+    jq = app.job_queue
+    jq.run_daily(morgen_erinnerung,  time(hour=8,  minute=0, tzinfo=ZEITZONE))
+    jq.run_daily(abend_zusammenfassung, time(hour=20, minute=0, tzinfo=ZEITZONE))
+
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
