@@ -257,7 +257,9 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if result["aktion"] == "neu_todo":
             todos = result.get("todos", [])
-            if not todos:
+if isinstance(todos, dict):   # ← NEU: falls Claude kein Array zurückgibt
+    todos = [todos]
+if not todos:
                 await msg.edit_text(f"Transkription:\n{text}\n\nKeine To-dos erkannt.")
                 return
             page_ids = []
