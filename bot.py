@@ -10,7 +10,7 @@ from notion_client import Client as NotionClient
 
 load_dotenv()
 
-groq   = Groq(api_key=os.environ["GROQ_API_KEY"])
+groq   = Groq(api_key=os.environ["GROQ_API_KEY"]) 
 claude = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 notion = NotionClient(auth=os.environ["NOTION_TOKEN"])
 DB     = os.environ["NOTION_DATABASE_ID"]
