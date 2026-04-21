@@ -1,4 +1,4 @@
-import os, json, base64
+import os, json, base64, asyncio
 import pytz
 from datetime import time as dtime, datetime, timedelta
 from dotenv import load_dotenv
@@ -395,10 +395,23 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     file  = await ctx.bot.get_file(voice.file_id)
     path  = f"/tmp/{voice.file_id}.ogg"
     await file.download_to_drive(path)
-    try:
+
+    def sync_verarbeite():
         text   = transkribiere(path)
         offene = offene_todos()
         result = analysiere(text, offene)
+        return text, offene, result
+
+    try:
+        try:
+            loop = asyncio.get_event_loop()
+            text, offene, result = await asyncio.wait_for(
+                loop.run_in_executor(None, sync_verarbeite),
+                timeout=25.0
+            )
+        except asyncio.TimeoutError:
+            await msg.edit_text("⏱️ Timeout – bitte nochmal versuchen.")
+            return
 
         if result["aktion"] == "neu_todo":
             todos = result.get("todos", [])
@@ -561,11 +574,10 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 erinnerungs_dt = ZEITZONE.localize(
                     datetime.strptime(f"{datum} {zeit}", "%Y-%m-%d %H:%M")
                 )
-                # Wenn Zeit bereits vorbei → morgen
                 if erinnerungs_dt <= datetime.now(ZEITZONE):
                     erinnerungs_dt += timedelta(days=1)
-                dt_iso   = erinnerungs_dt.isoformat()
-                chat_id  = update.effective_chat.id
+                dt_iso  = erinnerungs_dt.isoformat()
+                chat_id = update.effective_chat.id
                 erinnerung_speichern(chat_id, titel, dt_iso)
                 ctx.job_queue.run_once(
                     erinnerungs_callback,
@@ -584,7 +596,9 @@ async def sprachnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"Fehler: {e}")
     finally:
-        os.remove(path)
+        if os.path.exists(path):
+            os.remove(path)
+
 
 async def foto_nachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global letzte_aktion
