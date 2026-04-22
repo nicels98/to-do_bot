@@ -737,6 +737,16 @@ async def textnachricht(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+        # "to-do XYZ" oder "aufgabe XYZ" per Text
+    for prefix in ["to-do ", "todo ", "aufgabe ", "task "]:
+        if text.startswith(prefix):
+            titel = update.message.text.strip()[len(prefix):]
+            if titel:
+                pid = todo_hinzufügen(titel, "neutral")
+                letzte_aktion.update({"typ": "neu_todo", "page_ids": [pid], "titel": [titel]})
+                await update.message.reply_text(f"✅ To-do hinzugefügt: {titel}", reply_markup=undo_button())
+                return
+
     await update.message.reply_text(
         "Schick mir eine Sprachnachricht oder ein Foto.\nNutze die Buttons unten.",
         reply_markup=HAUPTMENU
