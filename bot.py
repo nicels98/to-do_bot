@@ -6,7 +6,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboard
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 from groq import Groq
 from anthropic import Anthropic
-from notion_client import Client as NotionClient
+from notion_client import Client as NotionClient 
 
 load_dotenv()
 
